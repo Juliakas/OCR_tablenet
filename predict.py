@@ -1,6 +1,7 @@
 """Predicting Module."""
 
 from collections import OrderedDict
+import os
 from typing import List
 
 import click
@@ -15,14 +16,19 @@ from skimage.measure import label, regionprops
 from skimage.morphology import closing, square, convex_hull_image
 from skimage.transform import resize
 from skimage.util import invert
+import cv2
+from vision_ai import detect_text
 
 from tablenet import TableNetModule
 
 
 class Predict:
     """Predict images using pre-trained model."""
-
-    def __init__(self, checkpoint_path: str, transforms: Compose, threshold: float = 0.5, per: float = 0.005):
+    def __init__(self,
+                 checkpoint_path: str,
+                 transforms: Compose,
+                 threshold: float = 0.5,
+                 per: float = 0.005):
         """Predict images using pre-trained TableNet model.
 
         Args:
@@ -49,21 +55,44 @@ class Predict:
         """
         processed_image = self.transforms(image=np.array(image))["image"]
 
-        table_mask, column_mask = self.model.forward(processed_image.unsqueeze(0))
+        table_mask, column_mask = self.model.forward(
+            processed_image.unsqueeze(0))
 
         table_mask = self._apply_threshold(table_mask)
         column_mask = self._apply_threshold(column_mask)
 
-        segmented_tables = self._process_tables(self._segment_image(table_mask))
+        segmented_tables = self._process_tables(
+            self._segment_image(table_mask))
 
         tables = []
         for table in segmented_tables:
-            segmented_columns = self._process_columns(self._segment_image(column_mask * table))
-            if segmented_columns:
-                cols = []
-                for column in segmented_columns.values():
-                    cols.append(self._column_to_dataframe(column, image))
-                tables.append(pd.concat(cols, ignore_index=True, axis=1))
+            segment_columns = False
+            if segment_columns:
+                segmented_columns = self._process_columns(
+                    self._segment_image(column_mask * table))
+                if segmented_columns:
+                    cols = []
+                    for column in segmented_columns.values():
+                        cols.append(self._column_to_dataframe(column, image))
+                    tables.append(pd.concat(cols, ignore_index=True, axis=1))
+            else:
+                width, height = image.size
+                table = resize(np.expand_dims(table, axis=2), (height, width),
+                               preserve_range=True) > 0.01
+
+                crop = table * image
+                white = np.ones(table.shape) * invert(table) * 255
+                crop = crop + white
+                cv2.imshow('Col', crop)
+                cv2.waitKey()
+                tables.append(
+                    pd.concat([
+                        Predict._extract_text(crop.astype(np.uint8),
+                                              method='tesseract')
+                    ],
+                              ignore_index=True,
+                              axis=1))
+
         return tables
 
     def _apply_threshold(self, mask):
@@ -103,17 +132,32 @@ class Predict:
     @staticmethod
     def _column_to_dataframe(column, image):
         width, height = image.size
-        column = resize(np.expand_dims(column, axis=2), (height, width), preserve_range=True) > 0.01
+        column = resize(np.expand_dims(column, axis=2), (height, width),
+                        preserve_range=True) > 0.01
 
+        # cv2.imshow('Col', np.ones(column.shape) * invert(column) * 255)
         crop = column * image
         white = np.ones(column.shape) * invert(column) * 255
         crop = crop + white
-        ocr = image_to_string(Image.fromarray(crop.astype(np.uint8)))
-        return pd.DataFrame({"col": [value for value in ocr.split("\n") if len(value) > 0]})
+        cv2.imshow('Col2', crop.astype(np.uint8))
+        cv2.waitKey()
+        return Predict._extract_text(crop.astype(np.uint8), method='tesseract')
+
+    @staticmethod
+    def _extract_text(img, method='tesseract'):
+        import re
+        if method == 'tesseract':
+            return pd.DataFrame([
+                re.sub(r'\s+', ' ', value)
+                for value in image_to_string(Image.fromarray(img)).split("\n")
+                if len(re.sub(r'\s+', '', value)) > 0
+            ])
+        elif method == 'vision_ai':
+            return pd.DataFrame(detect_text(img))
 
 
 @click.command()
-@click.option('--image_path', default="./data/Marmot_data/10.1.1.193.1812_24.bmp")
+@click.option('--image_path', default="./data/Marmot_data/10.1.1.1.2111_7.bmp")
 @click.option('--model_weights', default="./data/best_model.ckpt")
 def predict(image_path: str, model_weights: str) -> List[pd.DataFrame]:
     """Predict table content.
@@ -133,9 +177,18 @@ def predict(image_path: str, model_weights: str) -> List[pd.DataFrame]:
         ToTensorV2()
     ])
     pred = Predict(model_weights, transforms)
-
-    image = Image.open(image_path)
-    print(pred.predict(image))
+    files = [
+        f for f in os.listdir('../data/icdar2013/filtered_images')
+        if os.path.isfile(f'../data/icdar2013/filtered_images/{f}')
+        and f.startswith('eu-011')
+    ]
+    for file in files:
+        image = Image.open(f'../data/icdar2013/filtered_images/{file}')
+        predictions = pred.predict(image)
+        for i, df in enumerate(predictions):
+            df.to_csv(f'results_tes/{file[:-4]}_{i}.csv',
+                      index=False,
+                      header=False)
 
 
 if __name__ == '__main__':
